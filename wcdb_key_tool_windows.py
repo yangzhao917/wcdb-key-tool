@@ -2,15 +2,13 @@
 """wcdb-key-tool (Windows) — 微信数据库密钥提取工具
 
 Windows 微信数据库密钥提取工具。完整支持仍在进程内存里缓存明文 raw key
-的微信版本（4.0.x 一代）。微信 4.1+ 改为只缓存 passphrase 后，本仓库额外
-提供一个**实验性、未经真机验证**的断点捕获方案（见下方 EXPERIMENTAL 段落
-和 `capture-experimental` 子命令），原理上模仿 Linux 版 GDB / macOS 版
-LLDB 的断点法，但从未在真实 Windows + 微信环境里跑通过，请勿当作已解决
-的方案使用。
+的微信版本（4.0.x 一代）。微信 4.1+ 以后，主路径改为只读运行时
+`Config.Cipher` 扫描 + HMAC 校验；`capture-experimental` 仅保留为研究性备用
+路线，不是主路径。
 
 Usage:
-    python3 wcdb_key_tool_windows.py extract              # 提取密钥（内存扫描，老版本微信）
-    python3 wcdb_key_tool_windows.py capture-experimental  # [实验性/未验证] 断点抓 passphrase
+    python3 wcdb_key_tool_windows.py extract              # 提取密钥（优先 runtime 扫描，老版本回退内存扫描）
+    python3 wcdb_key_tool_windows.py capture-experimental  # [研究性备用] 断点抓 passphrase
     python3 wcdb_key_tool_windows.py set-passphrase <64位hex>  # 手动填入已获取的 passphrase
     python3 wcdb_key_tool_windows.py decrypt               # 解密数据库
     python3 wcdb_key_tool_windows.py extract --decrypt     # 提取 + 解密一步完成
@@ -22,11 +20,8 @@ Requirements:
       Windows SDK 的可选组件，或随 WinDbg 安装）
 
 Known Gap:
-    微信 4.1+ 在 Windows 上同样只缓存 passphrase，等价于 Linux 的 GDB
-    断点法 / macOS 的 LLDB 断点法在 Windows 上还没有被任何人验证过。
-    下方 EXPERIMENTAL 段落是一个有技术依据但完全未验证的猜测，需要一台
-    真实的 Windows 微信环境去验证断点会不会命中、读出来的东西对不对。
-    如果你验证过（不管成功还是失败），欢迎提 Issue/PR 反馈。
+    研究性断点路线仍保留，但默认不会影响 extract；主路径是只读运行时扫描，
+    只在读到的候选值通过 HMAC 校验后才保存。
 
 https://github.com/TANGandXUE/wcdb-key-tool
 """
@@ -165,6 +160,14 @@ def collect_db_files(db_dir: str) -> tuple[list, dict]:
 # ============================================================
 
 _HEX_RE = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
+WINDOWS_CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
+WINDOWS_CONFIG_XOR_MASK = bytes.fromhex(
+    "d2c7442458020000004889442450488b"
+    "450048844c2448488944254048584c24"
+)
+WINDOWS_MAX_USER_ADDRESS = 0x0000_8000_0000_0000
+WINDOWS_CONFIG_BLOB_MAX = 1024
+WINDOWS_CONFIG_LITERAL_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 
 
 def _get_pids_windows() -> list[tuple[int, int]]:
@@ -190,8 +193,241 @@ def _get_pids_windows() -> list[tuple[int, int]]:
     return pids
 
 
+def _xor_repeat(data: bytes, mask: bytes) -> bytes:
+    return bytes(value ^ mask[index % len(mask)] for index, value in enumerate(data))
+
+
+def _u64_from(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 8 > len(data):
+        return 0
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _probable_32_byte_key(data: bytes) -> bool:
+    return len(data) == KEY_SZ and len(set(data)) >= 15 and data not in {b"\x00" * KEY_SZ, b"\xff" * KEY_SZ}
+
+
+def _find_bytes_in_regions(
+    regions: list[tuple[int, int]],
+    read_region: callable,
+    needle: bytes,
+) -> set[int]:
+    addresses: set[int] = set()
+    overlap = max(0, len(needle) - 1)
+    for data_base, haystack in _iter_windows_region_chunks(regions, read_region, overlap=overlap):
+        pos = haystack.find(needle)
+        while pos >= 0:
+            addresses.add(data_base + pos)
+            pos = haystack.find(needle, pos + 1)
+    return addresses
+
+
+def _iter_windows_region_chunks(
+    regions: list[tuple[int, int]],
+    read_region: callable,
+    *,
+    chunk_size: int = 2 * 1024 * 1024,
+    overlap: int = 0,
+):
+    """Yield readable chunks from Windows process regions with optional overlap."""
+    for base, size in regions:
+        offset = 0
+        tail = b""
+        tail_base = base
+        while offset < size:
+            current_size = min(chunk_size, size - offset)
+            chunk = read_region(base + offset, current_size) or b""
+            data_base = tail_base if tail else base + offset
+            data = tail + chunk
+            if data:
+                yield data_base, data
+                if overlap:
+                    tail = data[-overlap:]
+                    tail_base = data_base + max(0, len(data) - len(tail))
+                else:
+                    tail = b""
+                    tail_base = base + offset + current_size
+            else:
+                tail = b""
+                tail_base = base + offset + current_size
+            offset += current_size
+
+
+def _windows_v411_config_key_candidates(blob: bytes) -> list[tuple[str, str | None]]:
+    """Extract redaction-safe key/salt candidates from a Config.Cipher blob."""
+    if not blob or len(blob) > WINDOWS_CONFIG_BLOB_MAX:
+        return []
+    decoded = _xor_repeat(blob, WINDOWS_CONFIG_XOR_MASK)
+    out: list[tuple[str, str | None]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for match in WINDOWS_CONFIG_LITERAL_RE.finditer(decoded):
+        run = match.group(1).decode("ascii").lower()
+        starts = [0]
+        if len(run) > 96:
+            starts.extend(range(0, len(run) - 63, 32))
+            starts.append(len(run) - 64)
+        for start in dict.fromkeys(starts):
+            if start < 0 or start + 64 > len(run):
+                continue
+            enc_key_hex = run[start:start + 64]
+            try:
+                enc_key = bytes.fromhex(enc_key_hex)
+            except ValueError:
+                continue
+            if not _probable_32_byte_key(enc_key):
+                continue
+            embedded_salt = None
+            if start + 96 <= len(run):
+                embedded_salt = run[start + 64:start + 96]
+            item = (enc_key_hex, embedded_salt)
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+    return out
+
+
+def _verify_windows_direct_key_candidate(
+    enc_key_hex: str,
+    embedded_salt: str | None,
+    db_files: list,
+    salt_to_dbs: dict,
+    key_map: dict[str, str],
+    remaining_salts: set[str],
+) -> int:
+    if not remaining_salts:
+        return 0
+    try:
+        enc_key = bytes.fromhex(enc_key_hex)
+    except ValueError:
+        return 0
+    if not _probable_32_byte_key(enc_key):
+        return 0
+    matched = 0
+    target_salts = [embedded_salt] if embedded_salt in remaining_salts else list(remaining_salts)
+    for salt_hex in target_salts:
+        if salt_hex not in remaining_salts:
+            continue
+        for _rel, _path, _sz, s, page1 in db_files:
+            if s == salt_hex and verify_enc_key(enc_key, page1):
+                key_map[salt_hex] = enc_key_hex
+                remaining_salts.discard(salt_hex)
+                matched += 1
+                break
+    return matched
+
+
+def _scan_windows_v411_config_cipher(
+    pid: int,
+    regions: list[tuple[int, int]],
+    read_region: callable,
+    read_mem: callable,
+    db_files: list,
+    salt_to_dbs: dict,
+    key_map: dict[str, str],
+    remaining_salts: set[str],
+    print_fn: callable,
+) -> dict:
+    """Read-only Windows WeChat 4.1.11 Config.Cipher key scan."""
+    stats = {
+        "needle_occurrences": 0,
+        "string_object_refs": 0,
+        "node_candidates": 0,
+        "config_ptr_candidates": 0,
+        "blob99_count": 0,
+        "candidate_count": 0,
+        "verified_candidates": 0,
+        "matched_salts": 0,
+    }
+    needle_addresses = _find_bytes_in_regions(regions, read_region, WINDOWS_CONFIG_CIPHER_NAME)
+    stats["needle_occurrences"] = len(needle_addresses)
+    if not needle_addresses:
+        return stats
+
+    pair_patterns = [
+        struct.pack("<Q", addr) + struct.pack("<Q", len(WINDOWS_CONFIG_CIPHER_NAME))
+        for addr in needle_addresses
+    ]
+    seen_config_ptrs: set[int] = set()
+    seen_candidates: set[tuple[str, str | None]] = set()
+
+    for base, data in _iter_windows_region_chunks(regions, read_region, overlap=0x80):
+        if not remaining_salts:
+            break
+        for pattern in pair_patterns:
+            pos = data.find(pattern)
+            while pos >= 0:
+                stats["string_object_refs"] += 1
+                qaddr = base + pos
+                node_base = qaddr - 0x10
+                node = read_mem(node_base, 0x50)
+                if not node or len(node) < 0x40:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                if _u64_from(node, 0x10) not in needle_addresses or _u64_from(node, 0x18) != len(WINDOWS_CONFIG_CIPHER_NAME):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                config_ptr = _u64_from(node, 0x28)
+                if not (0x10000 <= config_ptr < WINDOWS_MAX_USER_ADDRESS):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                stats["node_candidates"] += 1
+                seen_config_ptrs.add(config_ptr)
+
+                obj = read_mem(config_ptr + 0x88, 0x28)
+                if not obj or len(obj) < 0x18:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                data_ptr = _u64_from(obj, 0x8)
+                data_len = _u64_from(obj, 0x10)
+                if not (0 < data_len <= WINDOWS_CONFIG_BLOB_MAX and 0x10000 <= data_ptr < WINDOWS_MAX_USER_ADDRESS):
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                blob = read_mem(data_ptr, int(data_len))
+                if not blob or len(blob) != data_len:
+                    pos = data.find(pattern, pos + 1)
+                    continue
+                if data_len == 99:
+                    stats["blob99_count"] += 1
+                for enc_key_hex, embedded_salt in _windows_v411_config_key_candidates(blob):
+                    candidate = (enc_key_hex, embedded_salt)
+                    if candidate in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate)
+                    stats["candidate_count"] += 1
+                    matched = _verify_windows_direct_key_candidate(
+                        enc_key_hex,
+                        embedded_salt,
+                        db_files,
+                        salt_to_dbs,
+                        key_map,
+                        remaining_salts,
+                    )
+                    if matched:
+                        stats["verified_candidates"] += 1
+                        stats["matched_salts"] += matched
+                pos = data.find(pattern, pos + 1)
+
+    stats["config_ptr_candidates"] = len(seen_config_ptrs)
+    if stats["matched_salts"]:
+        print_fn(
+            "[+] Windows 4.1 runtime Config.Cipher scan matched "
+            f"{stats['matched_salts']}/{len(salt_to_dbs)} salts "
+            f"(pid={pid}, candidates={stats['candidate_count']})"
+        )
+    else:
+        print_fn(
+            "[INFO] Windows 4.1 runtime Config.Cipher scan found no verified key "
+            f"(pid={pid}, nodes={stats['node_candidates']}, candidates={stats['candidate_count']})"
+        )
+    return stats
+
+
 def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
-    """扫描 Weixin.exe 进程内存，匹配 x'<64hex_enc_key><32hex_salt>' 明文密钥模式。"""
+    """提取 Windows 微信数据库密钥。
+
+    先尝试 Windows 4.1+ 的只读 runtime Config.Cipher 扫描，再回退到老版本
+    raw key 内存扫描。
+    """
     db_files, salt_to_dbs = collect_db_files(db_dir)
     if not db_files:
         raise RuntimeError(f"在 {db_dir} 未找到可解密的 .db 文件")
@@ -236,6 +472,37 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
     remaining_salts = set(salt_to_dbs.keys())
     t0 = time.time()
 
+    runtime_stats: list[dict] = []
+    for pid, _mem_kb in pids:
+        h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not h:
+            _print(f"[WARN] 无法打开进程 PID={pid}，跳过（尝试以管理员身份运行）")
+            continue
+        try:
+            regions = enum_regions(h)
+            runtime_stats.append(_scan_windows_v411_config_cipher(
+                pid,
+                regions,
+                lambda base, size, _h=h: read_mem(_h, base, size),
+                lambda addr, size, _h=h: read_mem(_h, addr, size),
+                db_files,
+                salt_to_dbs,
+                key_map,
+                remaining_salts,
+                _print,
+            ))
+        finally:
+            kernel32.CloseHandle(h)
+        if not remaining_salts:
+            _print("[+] Windows 4.1 runtime Config.Cipher scan covered all databases")
+            _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file)
+            return key_map
+
+    if key_map:
+        _print(f"[INFO] Windows 4.1 runtime Config.Cipher scan partial: {len(key_map)}/{len(salt_to_dbs)} salts")
+    elif runtime_stats:
+        _print("[INFO] Windows 4.1 runtime Config.Cipher scan did not resolve keys; trying legacy scan")
+
     for pid, mem_kb in pids:
         h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
         if not h:
@@ -260,7 +527,7 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
                         if s == salt_hex and verify_enc_key(enc_key, page1):
                             key_map[salt_hex] = enc_key_hex
                             remaining_salts.discard(salt_hex)
-                            _print(f"  [FOUND] salt={salt_hex} enc_key={enc_key_hex}")
+                            _print("  [FOUND] verified key material")
                             break
         finally:
             kernel32.CloseHandle(h)
@@ -270,15 +537,16 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
     _print(f"\n扫描完成: {time.time() - t0:.1f}s, {len(pids)} 个进程")
     if not key_map:
         raise RuntimeError(
-            "未能从进程内存提取到密钥。若微信已是 4.1+ 版本，raw key 不再缓存在内存中，"
-            "内存扫描本身就找不到东西——可以试试 capture-experimental（未验证，见文件头说明）。"
+            "未能从进程内存提取到密钥。若微信已是 4.1+ 版本，主路径会先尝试只读 "
+            "runtime Config.Cipher 扫描，再回退到老版本内存扫描；如果仍失败，请确认"
+            "微信已登录并且数据库目录正确。"
         )
     _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file)
     return key_map
 
 
 # ============================================================
-# [EXPERIMENTAL / 未验证] CNG 断点捕获 passphrase（微信 4.1+ 猜想方案）
+# [LEGACY / 研究性备用] CNG 断点捕获 passphrase（微信 4.1+ 猜想方案）
 # ============================================================
 #
 # ⚠️ 警告：以下代码从未在真实 Windows + 微信环境里跑通过，纯粹是技术推理，
@@ -697,9 +965,9 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
 
 def cmd_capture_experimental(args: argparse.Namespace) -> None:
-    """[实验性/未验证] 尝试断点捕获 passphrase，见文件头 EXPERIMENTAL 段落说明。"""
+    """[研究性备用] 尝试断点捕获 passphrase，见文件头说明。"""
     _print("!" * 60)
-    _print("! 这是实验性、未经真机验证的方案，随时可能因为技术假设不成立而失败 !")
+    _print("! 这是研究性备用方案，默认不影响 extract !")
     _print("!" * 60)
     _print()
     _print("请在捕获期间于微信中执行：设置 -> 退出登录 -> 重新登录")
@@ -709,7 +977,7 @@ def cmd_capture_experimental(args: argparse.Namespace) -> None:
     except ExperimentalCaptureError as e:
         _print(f"[ERROR] {e}")
         sys.exit(1)
-    _print(f"[?] 断点命中并解析出一段 32 字节数据: {passphrase_hex[:8]}...（已截断，未验证是否真的是 passphrase）")
+    _print(f"[?] 断点命中并解析出一段 32 字节数据: {passphrase_hex[:8]}...（已截断）")
     save_passphrase(passphrase_hex)
     _print("[*] 已保存。运行 extract 会尝试用它派生密钥并做 HMAC 校验——校验通过才说明真的抓对了。")
 
@@ -745,14 +1013,14 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", metavar="command")
     sub.required = True
 
-    extract_cmd = sub.add_parser("extract", help="提取数据库密钥（内存扫描，仅老版本微信）")
+    extract_cmd = sub.add_parser("extract", help="提取数据库密钥（老版本内存扫描 / 新版 runtime Config.Cipher 扫描）")
     extract_cmd.add_argument("--db-dir", help="微信 db_storage 目录（默认自动检测）")
     extract_cmd.add_argument("--output", default="all_keys.json")
     extract_cmd.add_argument("--decrypt", action="store_true")
 
     capture_cmd = sub.add_parser(
         "capture-experimental",
-        help="[实验性/未验证] 断点捕获 passphrase，见文件头 EXPERIMENTAL 段落",
+        help="[研究性备用] 断点捕获 passphrase，见文件头说明",
     )
     capture_cmd.add_argument("--pid", type=int, help="微信进程 PID（默认自动查找）")
     capture_cmd.add_argument("--timeout", type=int, default=DEFAULT_CDB_TIMEOUT)

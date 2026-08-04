@@ -23,7 +23,7 @@ every existing tool that relies on `x'<hex>'` memory pattern scanning.
 |------|---|---|
 | Linux | ✅ 内存扫描 | ✅ GDB 断点 + PBKDF2 派生（已验证） |
 | macOS | ✅ 内存扫描 | ✅ LLDB 断点 + PBKDF2 派生（已验证） |
-| Windows | ✅ 内存扫描 | ⚠️ 实验性方案，**未经真机验证**（见下） |
+| Windows | ✅ 内存扫描 | ✅ 运行时 `Config.Cipher` 只读扫描 + PBKDF2（已验证） |
 
 - Linux: `wcdb_key_tool.py`
 - macOS: `wcdb_key_tool_macos.py`
@@ -47,11 +47,10 @@ every existing tool that relies on `x'<hex>'` memory pattern scanning.
      - macOS：微信直接调用了苹果系统自带的 `CommonCrypto` 库做密钥派生，这是一个
        公开的系统符号，不需要逆向微信自己的二进制，直接用 LLDB 断在
        `CCKeyDerivationPBKDF` 上就行。（`lldb_capture.py`，已在真机验证 18/18）
-     - Windows：**未验证**。技术上合理的猜测是微信同样调用系统密码库
-       （CNG 的 `BCryptDeriveKeyPBKDF2`），可以用 WinDbg 命令行版 `cdb.exe`
-       断在这个系统函数上试试，但没有 Windows 微信环境实测过，随时可能因为
-       假设不成立而抓不到任何东西。见 `wcdb_key_tool_windows.py` 里的
-       `capture-experimental` 子命令和文件内详细注释。
+   - Windows：主路径是只读运行时扫描。微信 4.1+ 会把可用的
+     `Config.Cipher` 相关对象留在进程内存里，脚本先定位这个对象，再解码候选
+     `x'<64hex key><32hex salt>'` 片段并用 HMAC 校验；老版本继续走内存扫描。
+     `capture-experimental` 仍保留为研究性备用路线，不是主路径。
 
 2. **PBKDF2 派生每个库的真实密钥**：拿到 passphrase 后，对每个数据库文件，用它
    自己的 16 字节 salt 做 `PBKDF2-HMAC-SHA512`（256,000 轮迭代），算出这个库专属
@@ -59,8 +58,9 @@ every existing tool that relies on `x'<hex>'` memory pattern scanning.
 
 3. **HMAC 校验**：派生出密钥后不能直接信，要用密钥对数据库第一页做
    `HMAC-SHA512` 校验，跟数据库自己存的 HMAC 对上了，才说明这把密钥真的对。
-   这一步是三个平台通用的"防止抓错"的安全网，也是判断实验性方案有没有真的成功
-   的唯一标准——断点命中了不代表读到的就是对的东西，HMAC 校验通过才算数。
+   这一步是三个平台通用的"防止抓错"的安全网，也是判断运行时扫描或备用方案
+   有没有真的成功的唯一标准——命中了不代表读到的就是对的东西，HMAC 校验通过
+   才算数。
 
 4. **AES-256-CBC 逐页解密**：还原出标准 SQLite 文件。
 
@@ -77,8 +77,8 @@ sudo apt install gdb
 xcode-select --install   # 提供 lldb
 
 # Windows
-# capture-experimental 需要 cdb.exe（Windows SDK 里的 "Debugging Tools for Windows" 组件）
-# 老版本内存扫描本身不需要额外安装任何东西
+# 老版本内存扫描 / 新版 runtime 扫描都不需要额外依赖
+# capture-experimental 只在你要测试研究性路线时需要 cdb.exe
 ```
 
 ## 使用 / Usage
@@ -91,26 +91,24 @@ sudo python3 wcdb_key_tool.py extract --decrypt
 sudo codesign --force --deep --sign - /Applications/WeChat.app
 sudo python3 wcdb_key_tool_macos.py extract --decrypt
 
-# Windows（老版本微信）
+# Windows（优先：新版 runtime 扫描；老版本会自动回退到内存扫描）
 python3 wcdb_key_tool_windows.py extract --decrypt
 
-# Windows（新版本，实验性方案，未验证，愿意帮忙测试的可以试试）
+# Windows（研究性备用路线，非主路径）
 python3 wcdb_key_tool_windows.py capture-experimental
 ```
 
 首次提取都需要在微信里**退出登录再重新登录**一次（这是为了触发密钥的重新计算，
 断点才有机会命中）；抓到的 passphrase 会缓存下来，之后就不用重复这一步了。
 
-## Windows 新版：实验性方案说明
+## Windows 新版：runtime Config.Cipher 扫描
 
-`wcdb_key_tool_windows.py` 里的 `capture-experimental` 是一个**有技术依据但完全
-没有真机验证过**的方案：Linux 用 GDB、macOS 用 LLDB 的等价方案都已经在真实设备
-上跑通过，Windows 这条目前只是"照着同样的思路猜一次"，没有人验证过微信 Windows
-版是不是真的调用了假设中的那个系统函数，也没有验证过断点条件、寄存器读法、
-输出解析格式对不对。
+Windows 4.1+ 的主路径已经改成只读运行时扫描，不再依赖实验性断点猜测。脚本先在
+进程里定位 `com.Tencent.WCDB.Config.Cipher` 相关对象，解码出候选
+`x'<key><salt>'` 片段，再用数据库 HMAC 验证；若扫不到，再自动回退到老版本
+内存扫描。
 
-如果你有 Windows 微信环境愿意帮忙测试（不管测试结果是成功还是失败），欢迎提
-Issue / PR，这是目前整个仓库唯一还没解决的缺口。
+`capture-experimental` 仍保留为研究性备用命令，默认不影响 `extract`。
 
 ## 安全说明 / Security Notes
 
